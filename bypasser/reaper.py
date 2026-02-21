@@ -113,10 +113,16 @@ def main() -> None:
     if args.cookies:
         os.environ["REAPER_COOKIES"] = args.cookies
 
-    # Target ingestion expects a file, so we write the provided URL
+    # Derive netloc once; every DB query will scope to this host so
+    # data from previous runs on different domains never bleeds in.
+    _target_url    = args.url.strip()
+    _target_netloc = urlparse(_target_url).netloc
+
+    # Write (overwrite) the transient ingestion file so every run
+    # starts clean regardless of what was scanned previously.
     filepath = "targets.txt"
     with open(filepath, "w", encoding="utf-8") as f:
-        f.write(args.url.strip() + "\n")
+        f.write(_target_url + "\n")
 
     conn = None
     t_start = time.monotonic()
@@ -129,11 +135,41 @@ def main() -> None:
 
         results = ingest_urls(filepath)
 
+        # ── Non-403/401 early-exit gate ────────────────────────────
+        # If the target never returned a restricted status during
+        # baseline, warn the user rather than silently running an
+        # empty pipeline.  They can override and continue.
+        if results:
+            _first_status = results[0].get("status_code")
+            if _first_status not in (401, 403):
+                print(
+                    f"\n[!]  Target returned HTTP {_first_status} — "
+                    f"this does not appear to be a restricted endpoint.\n"
+                    f"     The bypass engine is optimised for 403/401 "
+                    f"responses.\n"
+                )
+                _ans = input(
+                    "     Continue anyway? (y/n)  "
+                ).strip().lower()
+                if _ans not in ("y", "yes"):
+                    print("[*] Aborting.")
+                    return
+
         # ── Section A summary ──────────────────────────────────────
         conn = get_connection()
-        total = conn.execute("SELECT COUNT(*) FROM endpoints").fetchone()[0]
+        _nloc_pat = (
+            f"http://{_target_netloc}%",
+            f"https://{_target_netloc}%",
+        )
+        total = conn.execute(
+            "SELECT COUNT(*) FROM endpoints "
+            "WHERE url LIKE ? OR url LIKE ?",
+            _nloc_pat,
+        ).fetchone()[0]
         stable = conn.execute(
-            "SELECT COUNT(*) FROM endpoints WHERE is_stable = 1"
+            "SELECT COUNT(*) FROM endpoints "
+            "WHERE is_stable = 1 AND (url LIKE ? OR url LIKE ?)",
+            _nloc_pat,
         ).fetchone()[0]
         unstable_skipped = total - stable
 
@@ -152,8 +188,11 @@ def main() -> None:
             """
             SELECT url, method, header_hash
               FROM endpoints
-             WHERE is_stable = 1 AND status_code = 403
-            """
+             WHERE is_stable = 1
+               AND status_code IN (401, 403)
+               AND (url LIKE ? OR url LIKE ?)
+            """,
+            _nloc_pat,
         ).fetchall()
 
         if stable_403s:
@@ -175,7 +214,7 @@ def main() -> None:
             print("[*] Section B — No stable 403s to probe.\n")
 
         # ── Fingerprint Intelligence Report ────────────────────────
-        _print_intelligence_report(conn)
+        _print_intelligence_report(conn, _nloc_pat)
 
         # ── Section C ──────────────────────────────────────────────
         #    Populate the policy_variables table with every variable
@@ -195,7 +234,10 @@ def main() -> None:
         #    every stable-403 URL and create adjacency probes.
         target_urls = [
             row["url"] for row in conn.execute(
-                "SELECT url FROM endpoints WHERE is_stable = 1 AND status_code = 403"
+                "SELECT url FROM endpoints "
+                "WHERE is_stable = 1 AND status_code IN (401, 403) "
+                "AND (url LIKE ? OR url LIKE ?)",
+                _nloc_pat,
             ).fetchall()
         ]
         object_ids = extract_object_ids(target_urls) if target_urls else []
@@ -233,15 +275,13 @@ def main() -> None:
         #    Probe every active variable against each stable-403
         #    endpoint.  The collapsing loop freezes non-responsive
         #    variables and the re-verification gate filters noise.
-        # Scope to the current target's host so stale DB rows from
-        # previous runs on different domains don't bleed into this scan.
-        _parsed = urlparse(args.url)
-        _target_netloc = _parsed.netloc
+        # Scope to the current target's host only (_target_netloc set above).
         stable_ep_rows = conn.execute(
             """
             SELECT id, url
               FROM endpoints
-             WHERE is_stable = 1 AND status_code = 403
+             WHERE is_stable = 1
+               AND status_code IN (401, 403)
                AND (url LIKE ? OR url LIKE ?)
             """,
             (
@@ -321,9 +361,12 @@ def main() -> None:
             """
             SELECT ca.id, ca.endpoint_id, ca.combination_id
               FROM candidate_access ca
+              JOIN endpoints ep ON ep.id = ca.endpoint_id
              WHERE ca.is_verified = 0
+               AND (ep.url LIKE ? OR ep.url LIKE ?)
              ORDER BY ca.endpoint_id, ca.id
-            """
+            """,
+            _nloc_pat,
         ).fetchall()
 
         if candidate_rows:
@@ -433,10 +476,13 @@ def main() -> None:
             verified_ep_ids = [
                 row[0] for row in conn.execute(
                     """
-                    SELECT DISTINCT endpoint_id
-                      FROM candidate_access
-                     WHERE is_verified = 1
-                    """
+                    SELECT DISTINCT ca.endpoint_id
+                      FROM candidate_access ca
+                      JOIN endpoints ep ON ep.id = ca.endpoint_id
+                     WHERE ca.is_verified = 1
+                       AND (ep.url LIKE ? OR ep.url LIKE ?)
+                    """,
+                    _nloc_pat,
                 ).fetchall()
             ]
 
@@ -684,11 +730,14 @@ def main() -> None:
                 # K-1: Filter to High Impact findings.
                 high_impact_rows = conn.execute(
                     """
-                    SELECT DISTINCT endpoint_id
-                      FROM candidate_access
-                     WHERE is_verified  = 1
-                       AND impact_score >= 7
+                    SELECT DISTINCT ca.endpoint_id
+                      FROM candidate_access ca
+                      JOIN endpoints ep ON ep.id = ca.endpoint_id
+                     WHERE ca.is_verified  = 1
+                       AND ca.impact_score >= 7
+                       AND (ep.url LIKE ? OR ep.url LIKE ?)
                     """,
+                    _nloc_pat,
                 ).fetchall()
                 high_impact_ids = [
                     r["endpoint_id"] for r in high_impact_rows
@@ -930,7 +979,7 @@ def main() -> None:
         elapsed = time.monotonic() - t_start
         try:
             db = conn or get_connection()
-            _print_final_dashboard(db, elapsed, interrupted)
+            _print_final_dashboard(db, elapsed, interrupted, _target_netloc)
             db.close()
         except Exception:
             # If even the dashboard fails, still close cleanly.
@@ -946,10 +995,10 @@ def main() -> None:
 #  Final Dashboard
 # ═══════════════════════════════════════════════════════════════════════
 
-def _safe_count(conn, sql: str) -> int:
+def _safe_count(conn, sql: str, params: tuple = ()) -> int:
     """Execute a COUNT query, returning 0 on any error."""
     try:
-        row = conn.execute(sql).fetchone()
+        row = conn.execute(sql, params).fetchone()
         return int(row[0]) if row else 0
     except Exception:
         return 0
@@ -968,6 +1017,7 @@ def _fmt_elapsed(secs: float) -> str:
 
 def _print_final_dashboard(
     conn, elapsed: float, interrupted: bool = False,
+    target_netloc: str = "",
 ) -> None:
     """
     Display a clean ASCII dashboard summarising the entire
@@ -987,12 +1037,29 @@ def _print_final_dashboard(
         return text
 
     # ── Query every phase ─────────────────────────────────────────
-    # A: Endpoints
+    # A: Endpoints — always scoped to the current target domain so
+    # counts from previous runs on different hosts don't inflate totals.
+    _db_pat: tuple = (
+        (f"http://{target_netloc}%", f"https://{target_netloc}%")
+        if target_netloc
+        else ()
+    )
+    _ep_where = (
+        "WHERE url LIKE ? OR url LIKE ?"
+        if target_netloc
+        else ""
+    )
     ep_total = _safe_count(
-        conn, "SELECT COUNT(*) FROM endpoints",
+        conn,
+        f"SELECT COUNT(*) FROM endpoints {_ep_where}",
+        _db_pat,
     )
     ep_stable = _safe_count(
-        conn, "SELECT COUNT(*) FROM endpoints WHERE is_stable = 1",
+        conn,
+        f"SELECT COUNT(*) FROM endpoints "
+        f"WHERE is_stable = 1"
+        + (" AND (url LIKE ? OR url LIKE ?)" if target_netloc else ""),
+        _db_pat,
     )
 
     # B: Sensitivity
@@ -1086,10 +1153,11 @@ def _print_final_dashboard(
     # CVSS severity distribution
     _sev_list: list[str] = []
     try:
-        for row in conn.execute(
-            "SELECT id FROM endpoints "
-            "WHERE pipeline_status = 'COMPLETED'"
-        ).fetchall():
+        _sev_sql = (
+            "SELECT id FROM endpoints WHERE pipeline_status = 'COMPLETED'"
+            + (" AND (url LIKE ? OR url LIKE ?)" if target_netloc else "")
+        )
+        for row in conn.execute(_sev_sql, _db_pat).fetchall():
             ep_id = row[0]
             m = aggregate_final_metrics(ep_id)
             _sev_list.append(m.get("cvss", {}).get("severity", ""))
@@ -1334,23 +1402,27 @@ def _ensure_status_column(conn) -> None:
 #  Report
 # ═══════════════════════════════════════════════════════════════════════
 
-def _print_intelligence_report(conn) -> None:
+def _print_intelligence_report(conn, nloc_pat: tuple = ()) -> None:
     """
     Query the database and print a grouped summary of all WAF
     fingerprint intelligence gathered during the run.
     """
+    _url_filter = (
+        "AND (url LIKE ? OR url LIKE ?)" if nloc_pat else ""
+    )
     rows = conn.execute(
-        """
+        f"""
         SELECT waf_type,
                COUNT(*)                          AS endpoint_count,
                GROUP_CONCAT(DISTINCT fingerprint_group_id) AS group_ids,
                GROUP_CONCAT(DISTINCT denial_layer)         AS layers,
                GROUP_CONCAT(DISTINCT processing_depth)     AS depths
           FROM endpoints
-         WHERE is_stable = 1
+         WHERE is_stable = 1 {_url_filter}
          GROUP BY waf_type
          ORDER BY endpoint_count DESC
-        """
+        """,
+        nloc_pat,
     ).fetchall()
 
     if not rows:
