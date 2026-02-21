@@ -183,6 +183,41 @@ def probe_variable(endpoint_id: int, variable_id: int) -> dict:
     baseline_length: int = ep["body_length"]
     baseline_hash: str   = ep["header_hash"]
 
+    # Guard: if the initial baseline request was blocked or never
+    # completed, body_length / status_code may be NULL in the DB.
+    # Attempting arithmetic against None would raise TypeError, so
+    # we skip this variable entirely and return a safe no-op result.
+    if baseline_status is None or baseline_length is None:
+        logger.warning(
+            "[probe] endpoint_id=%d  var=%s — baseline not recorded "
+            "(status=%s  body_length=%s); skipping variable.",
+            endpoint_id, var_name, baseline_status, baseline_length,
+        )
+        return {
+            "endpoint_id":          endpoint_id,
+            "variable_id":          variable_id,
+            "variable_name":        var_name,
+            "variable_category":    category,
+            "test_value":           test_value,
+            "baseline_status":      baseline_status,
+            "baseline_body_length": baseline_length,
+            "baseline_header_hash": baseline_hash,
+            "mutated_status":       None,
+            "mutated_body_length":  None,
+            "mutated_header_hash":  None,
+            "mutated_entropy":      0.0,
+            "response_time_ms":     0.0,
+            "status_changed":       False,
+            "length_changed":       False,
+            "headers_changed":      False,
+            "structure_changed":    False,
+            "structure_pct":        0.0,
+            "is_interesting":       False,
+            "reproducible":         False,
+            "length_delta":         0,
+            "error":                "baseline_unavailable",
+        }
+
     # ── 3.  Build the mutated request spec ──────────────────────────
     mutated_url    = url
     mutated_method = method
@@ -442,20 +477,26 @@ def collapse_variables(endpoint_id: int) -> dict:
     # ── Probe untested variables ───────────────────────────────────
     live_diffs: list[dict]  = []
     frozen_names: list[str] = []
-    skipped = 0
-    tested  = 0
 
-    for var_row in all_vars:
+    # Pre-split to avoid augmented-assignment accumulator patterns.
+    to_probe = [v for v in all_vars if v["id"] not in already_tested]
+    skipped  = len(all_vars) - len(to_probe)
+
+    for var_row in to_probe:
         var_id   = var_row["id"]
         var_name = var_row["name"]
 
-        if var_id in already_tested:
-            skipped += 1
+        # Single-variable probe (auto-logged to sensitivity_results).
+        # Catch any unexpected exception so one bad variable cannot
+        # abort the entire endpoint sweep.
+        try:
+            diff = probe_variable(endpoint_id, var_id)
+        except Exception as exc:
+            logger.warning(
+                "[probe] endpoint_id=%d  var=%s — %s: %s; skipping.",
+                endpoint_id, var_name, type(exc).__name__, exc,
+            )
             continue
-
-        # Single-variable probe (auto-logged to sensitivity_results)
-        diff = probe_variable(endpoint_id, var_id)
-        tested += 1
 
         if diff["is_interesting"]:
             live_diffs.append(diff)
@@ -469,6 +510,8 @@ def collapse_variables(endpoint_id: int) -> dict:
         else:
             frozen_names.append(var_name)
             logger.info("  [FROZEN] %-35s  no change", var_name)
+
+    tested = len(live_diffs) + len(frozen_names)
 
     return {
         "endpoint_id":   endpoint_id,
@@ -570,11 +613,17 @@ def _execute_request(
         # Primer requests (Method Sequence only)
         if primer_methods:
             for pm in primer_methods:
-                session.request(
-                    pm, url,
-                    headers=headers,
-                    allow_redirects=False,
-                )
+                try:
+                    session.request(
+                        pm, url,
+                        headers=headers,
+                        allow_redirects=False,
+                    )
+                except requests.RequestException as primer_exc:
+                    logger.debug(
+                        "[probe] primer %s %s failed (non-fatal): %s",
+                        pm, url, primer_exc,
+                    )
 
         t0 = time.perf_counter()
         response = session.request(

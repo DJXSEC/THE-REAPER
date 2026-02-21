@@ -19,6 +19,7 @@ import sys
 import time
 
 import os
+from urllib.parse import urlparse
 
 from tqdm import tqdm  # type: ignore
 
@@ -232,12 +233,21 @@ def main() -> None:
         #    Probe every active variable against each stable-403
         #    endpoint.  The collapsing loop freezes non-responsive
         #    variables and the re-verification gate filters noise.
+        # Scope to the current target's host so stale DB rows from
+        # previous runs on different domains don't bleed into this scan.
+        _parsed = urlparse(args.url)
+        _target_netloc = _parsed.netloc
         stable_ep_rows = conn.execute(
             """
             SELECT id, url
               FROM endpoints
              WHERE is_stable = 1 AND status_code = 403
-            """
+               AND (url LIKE ? OR url LIKE ?)
+            """,
+            (
+                f"http://{_target_netloc}%",
+                f"https://{_target_netloc}%",
+            ),
         ).fetchall()
 
         if stable_ep_rows:
@@ -253,7 +263,14 @@ def main() -> None:
                 desc="Variable Probing",
                 unit="ep",
             ):
-                result = collapse_variables(ep_row["id"])
+                try:
+                    result = collapse_variables(ep_row["id"])
+                except Exception as _exc:
+                    logger.warning(
+                        "[Section D] endpoint_id=%d (%s) failed: %s — skipping.",
+                        ep_row["id"], ep_row["url"], _exc,
+                    )
+                    continue
                 # Keep only reproducible (verified) diffs
                 for diff in result["live_diffs"]:
                     if diff.get("reproducible"):
